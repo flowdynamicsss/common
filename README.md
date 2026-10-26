@@ -1,1 +1,367 @@
-# common
+<#
+MULE FLOW DIAGRAM GENERATOR - INSTRUCTIONS FOR THE USER AND AI
+
+Purpose
+    Generate PlantUML sequence diagrams from a Mule 4 project's XML files.
+    One .puml file is created for each recognized entry flow.
+    By default, the files are written inside the project's diagrams folder.
+
+Editable inputs
+    Project    - Mule project root containing src/main/mule.
+                 Default '.' means the current PowerShell directory.
+    Flow       - Optional exact name of one entry flow. Empty means all entries.
+    SourceName - Optional XML local names of additional source types.
+    OutputDir  - Optional output folder. Empty means <Project>/diagrams.
+    MaxDepth   - Maximum flow-ref traversal depth, from 1 to 500.
+
+    You can change the default values in the param block immediately below,
+    or pass parameters at runtime. Examples:
+
+    ./mule-graph.ps1 -Project '/path/to/my-mule-project'
+    ./mule-graph.ps1 -Project '/path/to/my-mule-project' -Flow 'my-main'
+    ./mule-graph.ps1 -Project '/path/to/my-mule-project' -SourceName 'watch'
+
+Running this text file
+    This file is provided as .txt for editing. Save or copy it as
+    mule-graph.ps1 before running it with PowerShell 7 (pwsh).
+    Existing diagram files with the same names are overwritten.
+
+Instructions for an AI editing this file
+    Ask for the project path if it is not provided and is needed.
+    Change the parameter defaults or the requested behavior as instructed.
+    Keep the script usable without modifying the Mule application.
+    Preserve XPath-based XML parsing, branch and flow-ref traversal,
+    explicit warnings, and protection against XML external entities.
+    Do not add credentials or copy secret values into diagrams.
+    Do not claim runtime tracing: this is static analysis.
+    Test changes using a representative project or synthetic fixture.
+
+Limitations
+    Dynamic references, imported flows outside src/main/mule, and unsupported
+    containers can make a diagram incomplete and produce warnings.
+    Error handlers are not traversed. Properties are not resolved.
+    Review generated files for sensitive information before sharing them.
+#>
+
+[CmdletBinding()]
+param(
+    [string]$Project = '.',
+
+    [string]$Flow,
+    [string[]]$SourceName = @(),
+    [string]$OutputDir,
+    [ValidateRange(1, 500)]
+    [int]$MaxDepth = 50
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$core = 'http://www.mulesoft.org/schema/mule/core'
+$apiKit = 'http://www.mulesoft.org/schema/mule/mule-apikit'
+$docNs = 'http://www.mulesoft.org/schema/mule/documentation'
+$script:flows = @{}
+$script:configs = @{}
+$script:lines = [System.Collections.Generic.List[string]]::new()
+$script:participants = @{}
+$script:participantLines = [System.Collections.Generic.List[string]]::new()
+$script:stack = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+
+function Text([string]$value) {
+    if ([string]::IsNullOrWhiteSpace($value)) { return '' }
+    # PlantUML control lines must never originate from an XML attribute.
+    return (($value -replace '[\r\n\t]+', ' ' -replace '\\', '/' -replace '"', "'") -replace '[<>]', '')
+}
+
+function SafeValue([string]$value) {
+    if ([string]::IsNullOrWhiteSpace($value)) { return '' }
+    if ($value -match '#\[' -or $value -match '(?i)(password|secret|token|credential|api.?key)') {
+        return '[dynamic or redacted]'
+    }
+    if ($value -notmatch '^[a-zA-Z0-9_.$\{\}/:\\*()\- ]+$') { return '[redacted]' }
+    return (Text $value)
+}
+
+function Attribute([System.Xml.XmlElement]$node, [string]$name) {
+    return $node.GetAttribute($name)
+}
+
+function Details([System.Xml.XmlElement]$node) {
+    $parts = [System.Collections.Generic.List[string]]::new()
+    $allowed = @('host', 'port', 'protocol', 'basePath', 'base-path', 'path', 'destination',
+        'queue', 'topic', 'directory', 'workingDir', 'url', 'property_host', 'property_port',
+        'property_protocol', 'property_basePath')
+    $nodes = @($node) + @($node.SelectNodes('.//*'))
+    foreach ($item in $nodes) {
+        foreach ($name in $allowed) {
+            if ($item.HasAttribute($name)) {
+                $value = SafeValue (Attribute $item $name)
+                if ($value) { $parts.Add("$name=$value") }
+            }
+        }
+    }
+    return ($parts | Select-Object -Unique) -join ', '
+}
+
+function Add-Line([string]$line) { $script:lines.Add($line) }
+
+function Add-Participant([string]$key, [string]$label) {
+    if (-not $script:participants.ContainsKey($key)) {
+        $id = 'S' + ($script:participants.Count + 1)
+        $script:participants[$key] = $id
+        $script:participantLines.Add(('participant "' + (Text $label) + '" as ' + $id))
+    }
+    return $script:participants[$key]
+}
+
+function Note([string]$message) {
+    Add-Line ('note over App: ' + (Text $message))
+}
+
+function Walk-Flow([string]$name, [int]$depth) {
+    if ($depth -ge $MaxDepth) {
+        Note "Maximum flow depth reached: $name"
+        Write-Warning "Maximum flow depth reached: $name"
+        return
+    }
+    if (-not $script:flows.ContainsKey($name)) {
+        Note "Unresolved flow-ref: $name"
+        Write-Warning "Unresolved flow-ref: $name (possibly an imported dependency)"
+        return
+    }
+    if (-not $script:stack.Add($name)) {
+        Note "Recursive flow-ref: $name"
+        Write-Warning "Recursive flow-ref: $name"
+        return
+    }
+    try {
+        Walk-Children $script:flows[$name] ($depth + 1)
+    }
+    finally { [void]$script:stack.Remove($name) }
+}
+
+function Walk-Children([System.Xml.XmlElement]$node, [int]$depth) {
+    foreach ($child in $node.ChildNodes) {
+        if ($child -is [System.Xml.XmlElement]) { Walk-Node $child $depth }
+    }
+}
+
+function Walk-Node([System.Xml.XmlElement]$node, [int]$depth) {
+    $local = $node.LocalName
+    $ns = $node.NamespaceURI
+
+    if ($ns -eq $core -and $local -eq 'flow-ref') {
+        $name = Attribute $node 'name'
+        if ($name -match '#\[' -or $name -match '\$\{') {
+            Note 'Dynamic flow-ref: target cannot be determined statically'
+            Write-Warning 'Dynamic flow-ref cannot be resolved statically.'
+        } elseif ($name) { Walk-Flow $name $depth }
+        else { Note 'flow-ref has no name'; Write-Warning 'flow-ref has no name.' }
+        return
+    }
+
+    if ($ns -eq $apiKit -and $local -eq 'router') {
+        $config = Attribute $node 'config-ref'
+        $routes = @($script:flows.Keys | Where-Object {
+            $_.EndsWith(':' + $config, [System.StringComparison]::OrdinalIgnoreCase)
+        } | Sort-Object)
+        if (-not $config -or $routes.Count -eq 0) {
+            Note "APIKit routes not found for config: $config"
+            Write-Warning "APIKit routes not found for config: $config"
+            return
+        }
+        $first = $true
+        foreach ($route in $routes) {
+            $routeName = $route.Substring(0, $route.Length - $config.Length - 1)
+            if ($first) { Add-Line ('alt ' + (Text $routeName)); $first = $false }
+            else { Add-Line ('else ' + (Text $routeName)) }
+            Walk-Flow $route $depth
+        }
+        Add-Line 'end'
+        return
+    }
+
+    if ($ns -eq $core -and $local -eq 'choice') {
+        $branches = @($node.SelectNodes("./*[local-name()='when' or local-name()='otherwise']"))
+        $first = $true
+        $number = 0
+        foreach ($branch in $branches) {
+            $number++
+            $label = if ($branch.LocalName -eq 'otherwise') { 'otherwise' } else { "branch $number" }
+            if ($first) { Add-Line "alt $label"; $first = $false }
+            else { Add-Line "else $label" }
+            Walk-Children $branch $depth
+        }
+        if (-not $first) { Add-Line 'end' }
+        return
+    }
+
+    if ($ns -eq $core -and $local -in @('scatter-gather', 'round-robin', 'first-successful')) {
+        $routes = @($node.SelectNodes("./*[local-name()='route']"))
+        $i = 0
+        foreach ($route in $routes) {
+            $i++
+            if ($local -eq 'scatter-gather') {
+                if ($i -eq 1) { Add-Line 'par route 1' } else { Add-Line "else route $i" }
+            } else {
+                if ($i -eq 1) { Add-Line "alt $local route 1" } else { Add-Line "else route $i" }
+            }
+            Walk-Children $route $depth
+        }
+        if ($i -gt 0) { Add-Line 'end' }
+        return
+    }
+
+    if ($ns -eq $core -and $local -in @('foreach', 'parallel-foreach', 'until-successful')) {
+        $label = if ($local -eq 'parallel-foreach') { 'parallel-foreach (may run concurrently)' } else { $local }
+        Add-Line ("loop " + $label)
+        Walk-Children $node $depth
+        Add-Line 'end'
+        return
+    }
+
+    if ($ns -eq $core -and $local -in @('try', 'async')) {
+        $label = if ($local -eq 'async') { 'async (may overlap)' } else { $local }
+        Add-Line ("group " + $label)
+        Walk-Children $node $depth
+        Add-Line 'end'
+        return
+    }
+
+    if ($ns -eq $core -and $local -eq 'error-handler') { return }
+    if ($ns -like '*/ee/core' -or $ns -like '*/validation') { return }
+
+    $ref = Attribute $node 'config-ref'
+    if ($ref -and $ns -ne $core) {
+        if ($ref -match '#\[' -or $ref -match '\$\{') {
+            Note "Dynamic config-ref on $($node.LocalName)"
+            Write-Warning "Dynamic config-ref on $($node.LocalName)"
+            return
+        }
+        $label = "$($node.Prefix) / $ref"
+        if ($script:configs.ContainsKey($ref)) {
+            $details = Details $script:configs[$ref]
+            if ($details) { $label += " ($details)" }
+        } else {
+            Write-Warning "Config not found: $ref"
+            $label += ' (config not found)'
+        }
+        $target = Add-Participant $ref $label
+        $operation = Text $node.LocalName
+        $opDetails = Details $node
+        if ($opDetails) { $operation += " ($opDetails)" }
+        Add-Line "App -> ${target}: $operation"
+        return
+    }
+    if ($node.SelectSingleNode(".//*[@config-ref or local-name()='flow-ref']")) {
+        Write-Warning "Skipped unsupported container: $($node.LocalName); nested calls may be missing."
+        Note "Unsupported container: $($node.LocalName); nested calls omitted"
+    }
+}
+
+function Is-Source([System.Xml.XmlElement]$node) {
+    if ($node.NamespaceURI -eq $core -and $node.LocalName -eq 'scheduler') { return $true }
+    if ($node.LocalName -in $SourceName) { return $true }
+    return ($node.NamespaceURI -ne $core -and
+        $node.LocalName -match '(?i)^(listener|subscriber|subscription|on-new.*|on-create.*|on-update.*|on-message.*|source)$')
+}
+
+$Project = (Resolve-Path -LiteralPath $Project).ProviderPath
+if (-not $OutputDir) {
+    $OutputDir = Join-Path $Project 'diagrams'
+}
+$OutputDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputDir)
+
+$muleDir = Join-Path $Project 'src/main/mule'
+if (-not (Test-Path -LiteralPath $muleDir -PathType Container)) {
+    throw "Mule source directory not found: $muleDir"
+}
+$files = @(Get-ChildItem -LiteralPath $muleDir -Recurse -File -Filter '*.xml' | Sort-Object FullName)
+if ($files.Count -eq 0) { throw "No Mule XML files found in $muleDir" }
+
+foreach ($file in $files) {
+    $settings = [System.Xml.XmlReaderSettings]::new()
+    $settings.DtdProcessing = [System.Xml.DtdProcessing]::Prohibit
+    $settings.XmlResolver = $null
+    $reader = [System.Xml.XmlReader]::Create($file.FullName, $settings)
+    try {
+        $xml = [System.Xml.XmlDocument]::new()
+        $xml.XmlResolver = $null
+        $xml.Load($reader)
+    } catch { throw "Cannot parse $($file.FullName): $($_.Exception.Message)" }
+    finally { $reader.Dispose() }
+    if ($xml.DocumentElement.LocalName -ne 'mule' -or $xml.DocumentElement.NamespaceURI -ne $core) {
+        Write-Warning "Not a Mule configuration; skipping $($file.FullName)"
+        continue
+    }
+    foreach ($element in $xml.SelectNodes('/*/*[@name]')) {
+        $name = Attribute $element 'name'
+        if ($element.NamespaceURI -eq $core -and $element.LocalName -in @('flow', 'sub-flow')) {
+            if ($script:flows.ContainsKey($name)) { throw "Duplicate flow name: $name" }
+            $script:flows[$name] = $element
+        } elseif ($element.NamespaceURI -ne $core) {
+            if ($script:configs.ContainsKey($name)) { throw "Duplicate config name: $name" }
+            $script:configs[$name] = $element
+        }
+    }
+}
+
+$entries = [System.Collections.Generic.List[object]]::new()
+foreach ($name in @($script:flows.Keys | Sort-Object)) {
+    $element = $script:flows[$name]
+    if ($element.LocalName -ne 'flow') { continue }
+    $first = $element.SelectSingleNode('*[1]')
+    if ($null -ne $first -and (Is-Source $first)) {
+        $entries.Add([pscustomobject]@{ Name = $name; Source = $first })
+    }
+}
+if ($Flow) {
+    if (-not $script:flows.ContainsKey($Flow)) { throw "Flow not found: $Flow" }
+    $entries = @($entries | Where-Object { $_.Name -ceq $Flow })
+    if ($entries.Count -eq 0) { throw "Flow '$Flow' has no recognized source. Supply -SourceName for this connector." }
+}
+if ($entries.Count -eq 0) { throw 'No entry flows found. Supply -SourceName for your connector.' }
+New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+$index = 0
+foreach ($entry in $entries) {
+    $script:lines.Clear()
+    $script:participants.Clear()
+    $script:participantLines.Clear()
+    $script:stack.Clear()
+    $index++
+    $source = $entry.Source
+    $sourceLabel = if ($source.Prefix) { "$($source.Prefix):$($source.LocalName)" } else { $source.LocalName }
+    $details = Details $source
+    if ($details) { $sourceLabel += " ($details)" }
+    $sourceRef = Attribute $source 'config-ref'
+    if ($sourceRef -and $script:configs.ContainsKey($sourceRef)) {
+        $configDetails = Details $script:configs[$sourceRef]
+        $sourceLabel += " [$sourceRef"
+        if ($configDetails) { $sourceLabel += ": $configDetails" }
+        $sourceLabel += ']'
+    } elseif ($sourceRef) {
+        $sourceLabel += " [$sourceRef - config not found]"
+        Write-Warning "Source config not found: $sourceRef"
+    }
+    Add-Line ('Source -> App: ' + (Text $sourceLabel))
+    [void]$script:stack.Add($entry.Name)
+    foreach ($child in $script:flows[$entry.Name].ChildNodes) {
+        if ($child -is [System.Xml.XmlElement] -and -not [object]::ReferenceEquals($child, $source)) {
+            Walk-Node $child 1
+        }
+    }
+    $out = [System.Collections.Generic.List[string]]::new()
+    $out.Add('@startuml')
+    $out.Add('title ' + (Text $entry.Name))
+    $out.Add('hide footbox')
+    $out.Add('actor "Source" as Source')
+    $out.Add('participant "Mule application" as App')
+    foreach ($line in $script:participantLines) { $out.Add($line) }
+    foreach ($line in $script:lines) { $out.Add($line) }
+    $out.Add('@enduml')
+    $safeName = ($entry.Name -replace '[^a-zA-Z0-9._-]', '_')
+    $outputPath = Join-Path $OutputDir ('{0:D3}-{1}.puml' -f $index, $safeName)
+    [System.IO.File]::WriteAllLines([System.IO.Path]::GetFullPath($outputPath), $out, [System.Text.UTF8Encoding]::new($false))
+    Write-Host "Created: $outputPath"
+}
+

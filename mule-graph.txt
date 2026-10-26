@@ -3,13 +3,15 @@ MULE FLOW DIAGRAM GENERATOR - INSTRUCTIONS FOR THE USER AND AI
 
 Purpose
     Generate PlantUML sequence diagrams from a Mule 4 project's XML files.
-    One .puml file is created for each recognized entry flow.
+    One .puml file is created for each flow and sub-flow.
+    Source-triggered diagrams use the flow name; other diagrams use the first
+    connector operation, including its config-ref and endpoint details.
     By default, the files are written inside the project's diagrams folder.
 
 Editable inputs
     Project    - Mule project root containing src/main/mule.
                  Default '.' means the current PowerShell directory.
-    Flow       - Optional exact name of one entry flow. Empty means all entries.
+    Flow       - Optional exact name of one flow or sub-flow. Empty means all.
     SourceName - Optional XML local names of additional source types.
     OutputDir  - Optional output folder. Empty means <Project>/diagrams.
     MaxDepth   - Maximum flow-ref traversal depth, from 1 to 500.
@@ -88,7 +90,7 @@ function Attribute([System.Xml.XmlElement]$node, [string]$name) {
 
 function Details([System.Xml.XmlElement]$node) {
     $parts = [System.Collections.Generic.List[string]]::new()
-    $allowed = @('host', 'port', 'protocol', 'basePath', 'base-path', 'path', 'destination',
+    $allowed = @('host', 'port', 'protocol', 'method', 'verb', 'basePath', 'base-path', 'path', 'destination',
         'queue', 'topic', 'directory', 'workingDir', 'url', 'property_host', 'property_port',
         'property_protocol', 'property_basePath')
     $nodes = @($node) + @($node.SelectNodes('.//*'))
@@ -101,6 +103,30 @@ function Details([System.Xml.XmlElement]$node) {
         }
     }
     return ($parts | Select-Object -Unique) -join ', '
+}
+
+function Operation-Label([System.Xml.XmlElement]$node) {
+    $name = if ($node.Prefix) { "$($node.Prefix):$($node.LocalName)" } else { $node.LocalName }
+    $ref = Attribute $node 'config-ref'
+    $label = $name
+    if ($ref) { $label += " [config-ref=$ref]" }
+    $details = Details $node
+    if ($ref -and $script:configs.ContainsKey($ref)) {
+        $configDetails = Details $script:configs[$ref]
+        if ($configDetails) {
+            if ($details) { $details += ", $configDetails" }
+            else { $details = $configDetails }
+        }
+    }
+    if ($details) { $label += " ($details)" }
+    return (Text $label)
+}
+
+function First-Operation([System.Xml.XmlElement]$node) {
+    foreach ($child in $node.SelectNodes('.//*')) {
+        if ($child.NamespaceURI -ne $core -and $child.HasAttribute('config-ref')) { return $child }
+    }
+    return $null
 }
 
 function Add-Line([string]$line) { $script:lines.Add($line) }
@@ -236,6 +262,8 @@ function Walk-Node([System.Xml.XmlElement]$node, [int]$depth) {
         if ($ref -match '#\[' -or $ref -match '\$\{') {
             Note "Dynamic config-ref on $($node.LocalName)"
             Write-Warning "Dynamic config-ref on $($node.LocalName)"
+            $target = Add-Participant 'dynamic-config' 'Dynamic connector config'
+            Add-Line "App -> ${target}: $(Operation-Label $node)"
             return
         }
         $label = "$($node.Prefix) / $ref"
@@ -247,9 +275,7 @@ function Walk-Node([System.Xml.XmlElement]$node, [int]$depth) {
             $label += ' (config not found)'
         }
         $target = Add-Participant $ref $label
-        $operation = Text $node.LocalName
-        $opDetails = Details $node
-        if ($opDetails) { $operation += " ($opDetails)" }
+        $operation = Operation-Label $node
         Add-Line "App -> ${target}: $operation"
         return
     }
@@ -309,18 +335,15 @@ foreach ($file in $files) {
 $entries = [System.Collections.Generic.List[object]]::new()
 foreach ($name in @($script:flows.Keys | Sort-Object)) {
     $element = $script:flows[$name]
-    if ($element.LocalName -ne 'flow') { continue }
     $first = $element.SelectSingleNode('*[1]')
-    if ($null -ne $first -and (Is-Source $first)) {
-        $entries.Add([pscustomobject]@{ Name = $name; Source = $first })
-    }
+    $source = if ($null -ne $first -and (Is-Source $first)) { $first } else { $null }
+    $entries.Add([pscustomobject]@{ Name = $name; Flow = $element; Source = $source })
 }
 if ($Flow) {
     if (-not $script:flows.ContainsKey($Flow)) { throw "Flow not found: $Flow" }
     $entries = @($entries | Where-Object { $_.Name -ceq $Flow })
-    if ($entries.Count -eq 0) { throw "Flow '$Flow' has no recognized source. Supply -SourceName for this connector." }
 }
-if ($entries.Count -eq 0) { throw 'No entry flows found. Supply -SourceName for your connector.' }
+if ($entries.Count -eq 0) { throw 'No Mule flows found.' }
 New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 $index = 0
 foreach ($entry in $entries) {
@@ -330,36 +353,44 @@ foreach ($entry in $entries) {
     $script:stack.Clear()
     $index++
     $source = $entry.Source
-    $sourceLabel = if ($source.Prefix) { "$($source.Prefix):$($source.LocalName)" } else { $source.LocalName }
-    $details = Details $source
-    if ($details) { $sourceLabel += " ($details)" }
-    $sourceRef = Attribute $source 'config-ref'
-    if ($sourceRef -and $script:configs.ContainsKey($sourceRef)) {
-        $configDetails = Details $script:configs[$sourceRef]
-        $sourceLabel += " [$sourceRef"
-        if ($configDetails) { $sourceLabel += ": $configDetails" }
-        $sourceLabel += ']'
-    } elseif ($sourceRef) {
-        $sourceLabel += " [$sourceRef - config not found]"
-        Write-Warning "Source config not found: $sourceRef"
+    $flow = $entry.Flow
+    $diagramName = $entry.Name
+    if ($null -ne $source) {
+        $sourceLabel = if ($source.Prefix) { "$($source.Prefix):$($source.LocalName)" } else { $source.LocalName }
+        $details = Details $source
+        if ($details) { $sourceLabel += " ($details)" }
+        $sourceRef = Attribute $source 'config-ref'
+        if ($sourceRef -and $script:configs.ContainsKey($sourceRef)) {
+            $configDetails = Details $script:configs[$sourceRef]
+            $sourceLabel += " [$sourceRef"
+            if ($configDetails) { $sourceLabel += ": $configDetails" }
+            $sourceLabel += ']'
+        } elseif ($sourceRef) {
+            $sourceLabel += " [$sourceRef - config not found]"
+            Write-Warning "Source config not found: $sourceRef"
+        }
+        Add-Line ('Source -> App: ' + (Text $sourceLabel))
+    } else {
+        $operation = First-Operation $flow
+        if ($null -ne $operation) { $diagramName = Operation-Label $operation }
     }
-    Add-Line ('Source -> App: ' + (Text $sourceLabel))
     [void]$script:stack.Add($entry.Name)
-    foreach ($child in $script:flows[$entry.Name].ChildNodes) {
-        if ($child -is [System.Xml.XmlElement] -and -not [object]::ReferenceEquals($child, $source)) {
+    foreach ($child in $flow.ChildNodes) {
+        if ($child -is [System.Xml.XmlElement] -and ($null -eq $source -or -not [object]::ReferenceEquals($child, $source))) {
             Walk-Node $child 1
         }
     }
     $out = [System.Collections.Generic.List[string]]::new()
     $out.Add('@startuml')
-    $out.Add('title ' + (Text $entry.Name))
+    $out.Add('title ' + (Text $diagramName))
     $out.Add('hide footbox')
-    $out.Add('actor "Source" as Source')
+    if ($null -ne $source) { $out.Add('actor "Source" as Source') }
     $out.Add('participant "Mule application" as App')
     foreach ($line in $script:participantLines) { $out.Add($line) }
     foreach ($line in $script:lines) { $out.Add($line) }
     $out.Add('@enduml')
-    $safeName = ($entry.Name -replace '[^a-zA-Z0-9._-]', '_')
+    $safeName = ($diagramName -replace '[^a-zA-Z0-9._-]', '_').Trim('_')
+    if (-not $safeName) { $safeName = $entry.Name }
     $outputPath = Join-Path $OutputDir ('{0:D3}-{1}.puml' -f $index, $safeName)
     [System.IO.File]::WriteAllLines([System.IO.Path]::GetFullPath($outputPath), $out, [System.Text.UTF8Encoding]::new($false))
     Write-Host "Created: $outputPath"
